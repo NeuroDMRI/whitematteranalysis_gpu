@@ -118,6 +118,91 @@ if triton is not None:
         result = libdevice.sqrt_rn(tl.reshape(values, (BLOCK,)))
         tl.store(Output + pair, result, pair < COUNT)
 
+    @triton.jit
+    def _argmin_combine(val_a, idx_a, val_b, idx_b):
+        a_nan = val_a != val_a
+        b_nan = val_b != val_b
+        a_wins = tl.where(
+            a_nan | b_nan,
+            tl.where(a_nan & b_nan, idx_a < idx_b, a_nan),
+            (val_a < val_b) | ((val_a == val_b) & (idx_a < idx_b)),
+        )
+        return tl.where(a_wins, val_a, val_b), tl.where(a_wins, idx_a, idx_b)
+
+    @triton.jit
+    def _nearest_centroids(Q, C, MinDist, BestIdx, NQ, NC,
+                           D: tl.constexpr, WIDTH: tl.constexpr,
+                           STEPS: tl.constexpr, BLOCK_C: tl.constexpr):
+        qi = tl.program_id(0).to(tl.int64)
+        dim = tl.arange(0, WIDTH)
+        d_mask = dim < D
+        q_row = tl.load(Q + qi * D + dim, d_mask, other=0.)
+        inf = tl.full((), float('inf'), tl.float64)
+        nc_i64 = tl.zeros((), dtype=tl.int64) + NC
+        best_dist = inf
+        best_idx = nc_i64
+        for base in range(0, NC, BLOCK_C):
+            c_idx = base + tl.arange(0, BLOCK_C)
+            c_valid = c_idx < NC
+            mask = c_valid[:, None] & d_mask[None, :]
+            c_vals = tl.load(C + c_idx[:, None].to(tl.int64) * D + dim[None, :], mask, other=0.)
+            diff = q_row[None, :] - c_vals
+            values = diff * diff
+            # Match cdist's descending warp-shuffle reduction, including sqrt rounding.
+            for step in tl.static_range(STEPS):
+                a, b = tl.split(tl.trans(tl.reshape(values,
+                    (BLOCK_C, 2, WIDTH // (1 << (step + 1)))), 0, 2, 1))
+                values = a + b
+            dists = libdevice.sqrt_rn(tl.reshape(values, (BLOCK_C,)))
+            dists = tl.where(c_valid, dists, inf)
+            idxs = tl.where(c_valid, c_idx.to(tl.int64), nc_i64)
+            block_dist, block_idx = tl.reduce((dists, idxs), axis=0, combine_fn=_argmin_combine)
+            best_dist, best_idx = _argmin_combine(best_dist, best_idx, block_dist, block_idx)
+        tl.store(MinDist + qi, best_dist, qi < NQ)
+        tl.store(BestIdx + qi, best_idx, qi < NQ)
+
+    @triton.jit
+    def _similarity_row_sums(F, Q, SimOut, DistOut, NF, NQ,
+                             P: tl.constexpr, WIDTH: tl.constexpr, STEPS: tl.constexpr,
+                             THRESHOLD2: tl.constexpr, BLOCK_N: tl.constexpr,
+                             BILATERAL: tl.constexpr = False, INV_SIGMA: tl.constexpr = 0.,
+                             COMPUTE_SQRT: tl.constexpr = False):
+        qi = tl.program_id(0)
+        p = tl.arange(0, WIDTH)[None, :]
+        qi_col = tl.zeros((BLOCK_N, 1), dtype=tl.int32) + qi
+        zero = tl.full((), 0., tl.float64)
+        inv_sigma = tl.full((), INV_SIGMA, tl.float64)
+        sim_acc = zero
+        dist_acc = zero
+        for base in range(0, NF, BLOCK_N):
+            fi_vec = base + tl.arange(0, BLOCK_N)
+            valid = fi_vec < NF
+            fi = fi_vec[:, None]
+            mask = valid[:, None]
+            a, ra = _values(F, Q, fi, qi_col, p, mask, P, False, THRESHOLD2, 'Mean', BILATERAL)
+            b, rb = _values(F, Q, fi, qi_col, p, mask, P, True, THRESHOLD2, 'Mean', BILATERAL)
+            if P > WIDTH:
+                mask2 = mask & (p + WIDTH < P)
+                a2, ra2 = _values(F, Q, fi, qi_col, p + WIDTH, mask2, P, False, THRESHOLD2, 'Mean', BILATERAL)
+                b2, rb2 = _values(F, Q, fi, qi_col, p + WIDTH, mask2, P, True, THRESHOLD2, 'Mean', BILATERAL)
+                a, b = a + a2, b + b2
+                if BILATERAL:
+                    ra, rb = ra + ra2, rb + rb2
+            # _values already took per-point sqrt; using 'MeanSquared' here reduces
+            # and divides by P without squaring, giving unsquared mean_dist directly.
+            mean_dist = _reduce_orientations(a, b, P, WIDTH, STEPS, 'MeanSquared', BLOCK_N)
+            if BILATERAL:
+                reflected = _reduce_orientations(ra, rb, P, WIDTH, STEPS, 'MeanSquared', BLOCK_N)
+                mean_dist = tl.minimum(mean_dist, reflected, propagate_nan=tl.PropagateNan.ALL)
+            d_sq = mean_dist * mean_dist
+            sim = libdevice.exp(-d_sq * inv_sigma)
+            sim_acc += tl.sum(tl.where(valid, sim, zero), axis=0)
+            if COMPUTE_SQRT:
+                dist_acc += tl.sum(tl.where(valid, mean_dist, zero), axis=0)
+        tl.store(SimOut + qi, sim_acc, qi < NQ)
+        if COMPUTE_SQRT:
+            tl.store(DistOut + qi, dist_acc, qi < NQ)
+
 
 def centroid_distances(queries, centroids):
     """Direct Euclidean distances for contiguous float64 CUDA vectors, 1<=D<=32."""
@@ -134,6 +219,29 @@ def centroid_distances(queries, centroids):
                 STEPS=(dimensions - 1).bit_length(), BLOCK=block,
                 num_warps=1, enable_fp_fusion=False)
     return output
+
+
+def nearest_centroids(queries, centroids):
+    """Fused Euclidean argmin for contiguous float64 CUDA vectors, 1<=D<=32."""
+    import torch
+
+    nq = queries.shape[0]
+    nc = centroids.shape[0]
+    if nc == 0:
+        raise IndexError('centroids must be non-empty')
+    min_distances = torch.empty((nq,), dtype=queries.dtype, device=queries.device)
+    best_indices = torch.empty((nq,), dtype=torch.int64, device=queries.device)
+    if nq == 0:
+        return min_distances, best_indices
+    dimensions = queries.shape[1]
+    block_c = 64 if dimensions <= 16 else 32
+    with torch.cuda.device(queries.device):
+        _nearest_centroids[(nq,)](
+            queries, centroids, min_distances, best_indices, nq, nc,
+            D=dimensions, WIDTH=triton.next_power_of_2(dimensions),
+            STEPS=(dimensions - 1).bit_length(), BLOCK_C=block_c,
+            num_warps=4, enable_fp_fusion=False)
+    return min_distances, best_indices
 
 
 def fiber_distances(queries, fixed, threshold, method, bilateral=False, sigmasq=6400.,
@@ -157,3 +265,39 @@ def fiber_distances(queries, fixed, threshold, method, bilateral=False, sigmasq=
             INV_GAUSSIAN=1. / similarity_sigmasq if similarity_sigmasq is not None else 0.,
             num_warps=1, enable_fp_fusion=False)
     return output
+
+
+def similarity_row_sums(queries, fixed, threshold, sigmasq, bilateral=False,
+                        sqrt_distance_sums=False):
+    """Fused float64 Mean-distance similarity (and optional sqrt-distance) row sums."""
+    import torch
+
+    nq = queries.shape[0]
+    nf = fixed.shape[0]
+    if nq == 0:
+        sim_sums = torch.empty((0,), dtype=fixed.dtype, device=fixed.device)
+        dist_sums = (torch.empty((0,), dtype=fixed.dtype, device=fixed.device)
+                     if sqrt_distance_sums else None)
+        return sim_sums, dist_sums
+    if nf == 0:
+        sim_sums = torch.zeros((nq,), dtype=fixed.dtype, device=fixed.device)
+        dist_sums = (torch.zeros((nq,), dtype=fixed.dtype, device=fixed.device)
+                     if sqrt_distance_sums else None)
+        return sim_sums, dist_sums
+
+    sim_sums = torch.empty((nq,), dtype=fixed.dtype, device=fixed.device)
+    dist_sums = (torch.empty((nq,), dtype=fixed.dtype, device=fixed.device)
+                 if sqrt_distance_sums else None)
+    points = fixed.shape[1]
+    steps = points.bit_length() - 1
+    block_n = 64
+    with torch.cuda.device(fixed.device):
+        _similarity_row_sums[(nq,)](
+            fixed, queries, sim_sums, dist_sums if sqrt_distance_sums else sim_sums,
+            nf, nq,
+            P=points, WIDTH=1 << steps, STEPS=steps,
+            THRESHOLD2=threshold * threshold, BLOCK_N=block_n,
+            BILATERAL=bilateral, INV_SIGMA=1. / sigmasq,
+            COMPUTE_SQRT=sqrt_distance_sums,
+            num_warps=4, enable_fp_fusion=False)
+    return sim_sums, dist_sums

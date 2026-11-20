@@ -74,6 +74,93 @@ class CentroidKernelTests(unittest.TestCase):
         for a, b in zip(actual, expected):
             self.assertTrue(torch.equal(a, b))
 
+    def test_fused_nearest_centroids_matches_cdist_min(self):
+        import torch
+        if distance_kernel.triton is None:
+            self.skipTest('Triton is unavailable')
+        torch.manual_seed(42)
+        for dimensions in (1, 2, 10, 16, 32):
+            for scale in (1e-100, 1., 1e100):
+                for nc in (5, 64, 65, 257):
+                    query = torch.randn((37, dimensions), dtype=torch.float64, device='cuda') * scale
+                    centroids = torch.randn((nc, dimensions), dtype=torch.float64, device='cuda') * scale
+                    actual_d, actual_i = distance_kernel.nearest_centroids(query, centroids)
+                    expected_d, expected_i = torch.cdist(
+                        query, centroids, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+                    self.assertEqual(actual_i.dtype, torch.int64)
+                    self.assertTrue(torch.equal(actual_i, expected_i), (dimensions, scale, nc))
+                    torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+            # Exact ties across blocks (first centroid wins)
+            query = torch.zeros((4, dimensions), dtype=torch.float64, device='cuda')
+            centroids = torch.ones((150, dimensions), dtype=torch.float64, device='cuda')
+            centroids[3] = 0.
+            centroids[70] = 0.
+            actual_d, actual_i = distance_kernel.nearest_centroids(query, centroids)
+            expected_d, expected_i = torch.cdist(
+                query, centroids, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+            self.assertTrue(torch.equal(actual_i, expected_i))
+            torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+            # All-+inf distances against finite centroids (first centroid 0 wins)
+            inf_q = torch.zeros((2, dimensions), dtype=torch.float64, device='cuda')
+            inf_q[1, 0] = float('inf')
+            finite_c = torch.ones((150, dimensions), dtype=torch.float64, device='cuda')
+            actual_d, actual_i = distance_kernel.nearest_centroids(inf_q, finite_c)
+            expected_d, expected_i = torch.cdist(
+                inf_q, finite_c, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+            self.assertTrue(torch.equal(actual_i, expected_i))
+            torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+            # NaN and Inf entries (in queries and in later centroid blocks)
+            query = torch.zeros((5, dimensions), dtype=torch.float64, device='cuda')
+            centroids = torch.ones((150, dimensions), dtype=torch.float64, device='cuda')
+            query[0, 0] = float('nan')
+            query[1, 0] = float('inf')
+            centroids[75, 0] = float('nan')
+            centroids[120, 0] = float('nan')
+            actual_d, actual_i = distance_kernel.nearest_centroids(query, centroids)
+            expected_d, expected_i = torch.cdist(
+                query, centroids, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+            self.assertTrue(torch.equal(actual_i, expected_i))
+            torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+            # Empty queries (0, D)
+            empty_q = torch.empty((0, dimensions), dtype=torch.float64, device='cuda')
+            actual_d, actual_i = distance_kernel.nearest_centroids(empty_q, centroids)
+            expected_d, expected_i = torch.cdist(
+                empty_q, centroids, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+            self.assertEqual(actual_i.dtype, torch.int64)
+            self.assertTrue(torch.equal(actual_i, expected_i))
+            torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+            # Empty centroids (0, D) raises IndexError matching torch.min(1)
+            empty_c = torch.empty((0, dimensions), dtype=torch.float64, device='cuda')
+            for q_in in (query, empty_q):
+                with self.assertRaises(IndexError):
+                    distance_kernel.nearest_centroids(q_in, empty_c)
+
+
+class CentroidKernelApiTests(unittest.TestCase):
+    def test_nearest_centroids_symbol_and_cpu_fallback(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+        self.assertTrue(hasattr(distance_kernel, 'nearest_centroids'))
+        self.assertTrue(callable(distance_kernel.nearest_centroids))
+        query = torch.zeros((4, 10), dtype=torch.float64)
+        centroids = torch.ones((7, 10), dtype=torch.float64)
+        query[0, 0], query[1, 1] = float('nan'), float('inf')
+        actual_d, actual_i = linalg._nearest_centroids(query, centroids)
+        expected_d, expected_i = torch.cdist(
+            query, centroids, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+        self.assertEqual(actual_i.dtype, torch.int64)
+        self.assertTrue(torch.equal(actual_i, expected_i))
+        torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+        # Empty centroids (nc == 0) raises IndexError for both nq > 0 and nq == 0
+        empty_c = torch.empty((0, 10), dtype=torch.float64)
+        for q_in in (query, torch.empty((0, 10), dtype=torch.float64)):
+            with self.assertRaises(IndexError):
+                distance_kernel.nearest_centroids(q_in, empty_c)
+            with self.assertRaises(IndexError):
+                torch.cdist(q_in, empty_c, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+
 
 if __name__ == '__main__':
     unittest.main()

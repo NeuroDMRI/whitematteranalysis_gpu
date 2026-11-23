@@ -21,6 +21,11 @@ _SEPARATION = None
 _TIMINGS = {}
 _PROFILE_OUTPUT = None
 _FILE_COUNT = 0
+_HEMISPHERE_FOLDERS = (
+    'tracts_left_hemisphere',
+    'tracts_right_hemisphere',
+    'tracts_commissural',
+)
 
 
 def _timed(name, function, *args):
@@ -52,11 +57,17 @@ def _prepare_native_modules():
     for path in slicer.app.moduleManager().factoryManager().searchPaths:
         if path not in sys.path:
             sys.path.append(path)
-    from vtkSlicerTractographyDisplayModuleLogicPython import vtkSlicerFiberBundleLogic
     from vtkSlicerTransformsModuleLogicPython import vtkSlicerTransformLogic
+    transform_logic = vtkSlicerTransformLogic()
+    try:
+        from vtkSlicerTractographyDisplayModuleLogicPython import vtkSlicerFiberBundleLogic
+    except ImportError:
+        # Slicer core handles .vtk/.vtp polydata hardening via vtkMRMLModelNode
+        # when the SlicerDMRI extension is not installed.
+        return None, transform_logic, 'vtkMRMLModelNode'
     fiber_logic = vtkSlicerFiberBundleLogic()
     fiber_logic.SetMRMLScene(slicer.mrmlScene)
-    return fiber_logic, vtkSlicerTransformLogic()
+    return fiber_logic, transform_logic, 'vtkMRMLFiberBundleNode'
 
 
 def _load_transform(filename):
@@ -99,8 +110,7 @@ def harden_transform(polydata, transform_node, logic, fiber_node, storage_node,
         if split_output_dir is None:
             return
         split_files = [os.path.join(split_output_dir, folder, os.path.basename(polydata))
-                       for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere',
-                                      'tracts_commissural')]
+                       for folder in _HEMISPHERE_FOLDERS]
         if all(os.path.isfile(path) for path in split_files):
             return
         wma, _ = _prepare_split_modules()
@@ -108,22 +118,26 @@ def harden_transform(polydata, transform_node, logic, fiber_node, storage_node,
                output_name, split_output_dir)
         return
     
-    # Storage reads reuse the fiber/display nodes rather than recreating them
-    # through the GUI I/O manager for every cluster. Clear the previous input.
+    # Storage reads reuse the fiber/model and display nodes rather than recreating
+    # them through the GUI I/O manager for every cluster. Clear the previous input.
     fiber_node.SetAndObservePolyData(None)
     storage_node.SetCoordinateSystem(storage_node.CoordinateSystemRAS)
     storage_node.SetFileName(str(polydata))
     if not _timed('read', storage_node.ReadData, fiber_node):
-        raise RuntimeError('Could not load polydata file: ' + polydata)
+        raise RuntimeError('Could not load polydata file: ' + str(polydata))
     data = fiber_node.GetPolyData()
+    if data is None:
+        raise RuntimeError('Loaded polydata is empty/None: ' + str(polydata))
     if data.GetNumberOfCells() == 0:
         _timed('write', shutil.copyfile, polydata, output_name)
     else:
         fiber_node.SetAndObserveTransformNodeID(transform_node.GetID())
         if not _timed('harden', logic.hardenTransform, fiber_node):
-            raise RuntimeError('Could not harden transform: ' + polydata)
+            raise RuntimeError('Could not harden transform: ' + str(polydata))
         data = fiber_node.GetPolyData()
-        if split_output_dir is None or os.path.splitext(output_name)[1] != '.vtp':
+        if data is None:
+            raise RuntimeError('Hardened polydata is empty/None: ' + str(polydata))
+        if split_output_dir is None or os.path.splitext(output_name)[1].lower() != '.vtp':
             storage_node.SetFileName(output_name)
             # The GUI file writer selects RAS even if the input was LPS.
             storage_node.SetCoordinateSystem(storage_node.CoordinateSystemRAS)
@@ -147,8 +161,10 @@ def _remove_fiber_node(fiber_node):
     # Storage reads create display/properties nodes once. Release all of them.
     owned = [fiber_node.GetNthDisplayNode(i)
              for i in range(fiber_node.GetNumberOfDisplayNodes())]
-    owned.extend([display.GetDiffusionTensorDisplayPropertiesNode()
-                  for display in list(owned)])
+    for display in list(owned):
+        get_tensor_properties = getattr(display, 'GetDiffusionTensorDisplayPropertiesNode', None)
+        if get_tensor_properties is not None:
+            owned.append(get_tensor_properties())
     owned.append(fiber_node.GetStorageNode())
     slicer.mrmlScene.RemoveNode(fiber_node)
     for node in owned:
@@ -199,7 +215,12 @@ def main():
     # Each process handles independent files; avoid nested native thread pools.
     vtk.vtkMultiThreader.SetGlobalMaximumNumberOfThreads(1)
     vtk.vtkMultiThreader.SetGlobalDefaultNumberOfThreads(1)
-    fiber_logic, logic = _timed('native_modules', _prepare_native_modules)
+    native_modules = _timed('native_modules', _prepare_native_modules)
+    if len(native_modules) == 2:
+        fiber_logic, logic = native_modules
+        node_class = 'vtkMRMLFiberBundleNode' if fiber_logic is not None else 'vtkMRMLModelNode'
+    else:
+        fiber_logic, logic, node_class = native_modules
     if args.split_output_directory is not None:
         _timed('imports', _prepare_split_modules)
     if args.input_status is not None:
@@ -216,23 +237,32 @@ def main():
     else:
         raise ValueError('Input is not a file or directory: ' + args.polydata)
 
+    os.makedirs(args.outdir, exist_ok=True)
+    if args.split_output_directory is not None:
+        for folder in _HEMISPHERE_FOLDERS:
+            os.makedirs(os.path.join(args.split_output_directory, folder), exist_ok=True)
+
     input_polydatas = input_polydatas[args.partition_index::args.partition_count]
     _FILE_COUNT = len(input_polydatas)
 
     transform_node = _timed('transform_load', _load_transform, str(args.transform))
     slicer.mrmlScene.StartState(slicer.mrmlScene.BatchProcessState)
-    fiber_node = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLFiberBundleNode')
-    storage_node = fiber_node.CreateDefaultStorageNode()
-    slicer.mrmlScene.AddNode(storage_node)
-    fiber_node.SetAndObserveStorageNodeID(storage_node.GetID())
+    fiber_node = None
     try:
+        fiber_node = slicer.mrmlScene.AddNewNodeByClass(node_class)
+        if fiber_node is None:
+            raise RuntimeError('Could not create MRML node: ' + node_class)
+        storage_node = fiber_node.CreateDefaultStorageNode()
+        slicer.mrmlScene.AddNode(storage_node)
+        fiber_node.SetAndObserveStorageNodeID(storage_node.GetID())
         if args.inverse == '1':
             transform_node.Inverse()
         for polydata in input_polydatas:
             harden_transform(polydata, transform_node, logic, fiber_node, storage_node,
                              args.outdir, args.split_output_directory)
     finally:
-        _remove_fiber_node(fiber_node)
+        if fiber_node is not None:
+            _remove_fiber_node(fiber_node)
         storage = transform_node.GetStorageNode()
         slicer.mrmlScene.RemoveNode(transform_node)
         if storage is not None and storage.GetScene() == slicer.mrmlScene:

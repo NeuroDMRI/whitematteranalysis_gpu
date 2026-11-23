@@ -5,10 +5,17 @@ import sys
 from threading import Lock
 import numpy
 
-_core = getattr(numpy, '_core', None)
-if _core is None:
-    _core = numpy.core
-_set_hugepage = getattr(_core.multiarray, '_set_madvise_hugepage', None)
+
+def _resolve_set_hugepage(numpy_module=numpy):
+    """Locate NumPy's madvise huge-page toggle across 1.x, 1.26 stubs, and 2.x."""
+    core = getattr(numpy_module, '_core', None)
+    multiarray = getattr(core, 'multiarray', None)
+    if multiarray is None:
+        multiarray = getattr(getattr(numpy_module, 'core', None), 'multiarray', None)
+    return getattr(multiarray, '_set_madvise_hugepage', None)
+
+
+_set_hugepage = _resolve_set_hugepage(numpy)
 
 _lock = Lock()
 _users = 0
